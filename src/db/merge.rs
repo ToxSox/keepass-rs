@@ -10,7 +10,10 @@ use chrono::NaiveDateTime;
 use thiserror::Error;
 
 use crate::{
-    db::{CustomIconId, Entry, EntryId, Group, GroupId, GroupRef, History, MoveGroupError, Times},
+    db::{
+        Attachment, AttachmentId, CustomIconId, Entry, EntryId, Group, GroupId, GroupRef, History,
+        MoveGroupError, Times,
+    },
     Database,
 };
 
@@ -79,6 +82,11 @@ impl Database {
         let mut log = MergeLog::default();
         merge_icons(self, other, &mut log)?;
         merge_groups(self, other, &mut log)?;
+
+        // entries now refer to attachments copied from `other`, and versions
+        // that went into a history moved positions: bring the references up
+        // to date and drop what no version uses any more
+        self.remove_unused_attachments();
 
         Ok(log)
     }
@@ -414,6 +422,18 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
 
         let parent_id = source_entry.parent().id();
 
+        if dest_db.group(parent_id).is_none() {
+            log.warnings.push(format!(
+                "Cannot add entry {} because its parent group {} does not exist in the destination database.",
+                id, parent_id,
+            ));
+            continue;
+        }
+
+        // attachment IDs belong to the source database: copy the attachments over
+        let mut imported = source_entry.deref().clone();
+        import_attachments(dest_db, source_db, &mut imported);
+
         let Some(mut parent) = dest_db.group_mut(parent_id) else {
             log.warnings.push(format!(
                 "Cannot add entry {} because its parent group {} does not exist in the destination database.",
@@ -427,7 +447,7 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             .add_entry_with_id(id)
             .expect("entry to be (re-)added should not exist yet");
 
-        *entry = source_entry.deref().clone();
+        *entry = imported;
 
         log.events.push(MergeEvent {
             target: MergeEventTarget::Entry(id),
@@ -466,6 +486,12 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
 
     // Handle entries that exist in both source and destination.
     for &id in dest_entries.intersection(&source_entries) {
+        // the source's version with its attachments copied into dest, so that
+        // its attachment IDs (and those of its history) are valid in dest
+        #[allow(clippy::unwrap_used)] // id is guaranteed to exist in source
+        let mut imported = source_db.entry(id).unwrap().deref().clone();
+        import_attachments(dest_db, source_db, &mut imported);
+
         #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
         let mut dest_entry = dest_db.entry_mut(id).unwrap();
 
@@ -537,7 +563,7 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             ));
         }
 
-        let source_history = source_entry.history.clone().unwrap_or_else(|| {
+        let source_history = imported.history.clone().unwrap_or_else(|| {
             log.warnings.push(format!("Source entry {} had no history.", id));
             History::default()
         });
@@ -577,8 +603,7 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             dest_entry.background_color = source_entry.background_color.clone();
             dest_entry.override_url = source_entry.override_url.clone();
             dest_entry.quality_check = source_entry.quality_check;
-
-            // TODO: attachments and custom_icons_id
+            dest_entry.attachments = imported.attachments.clone();
 
             log.events.push(MergeEvent {
                 target: MergeEventTarget::Entry(id),
@@ -588,7 +613,7 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             // The destination entry is more recent. Keep it, but file the source's version
             // in its history, as KeePassXC does: when both sides changed the entry, that
             // version is the only record of the source's change.
-            let mut source_version = source_entry.clone();
+            let mut source_version = imported.clone();
             source_version.history = None;
             // a move files a version with the same timestamp and contents, in the old location
             let already_filed = merged_history.entries.iter().any(|version| {
@@ -618,6 +643,55 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
     }
 
     Ok(())
+}
+
+/// Points an entry cloned from `source` (and its history) at copies of its
+/// attachments in `dest`. Attachment IDs are positions in one database, so
+/// they mean nothing in the other one.
+///
+/// A reference to an attachment missing in `source` is dropped: kept as is, it
+/// would point at whatever attachment `dest` has under that ID.
+fn import_attachments(dest: &mut Database, source: &Database, entry: &mut Entry) {
+    import_version_attachments(dest, source, entry);
+    if let Some(history) = entry.history.as_mut() {
+        for version in history.entries.iter_mut() {
+            import_version_attachments(dest, source, version);
+        }
+    }
+}
+
+fn import_version_attachments(dest: &mut Database, source: &Database, version: &mut Entry) {
+    let attachments = std::mem::take(&mut version.attachments);
+    version.attachments = attachments
+        .into_iter()
+        .filter_map(|(name, id)| import_attachment(dest, source, id).map(|id| (name, id)))
+        .collect();
+}
+
+/// Returns the ID in `dest` of the attachment `id` of `source`: an attachment
+/// with the same data if `dest` has one (KeePass shares equal attachments),
+/// a new copy otherwise.
+fn import_attachment(dest: &mut Database, source: &Database, id: AttachmentId) -> Option<AttachmentId> {
+    let attachment = source.attachments.get(&id)?;
+    if let Some(existing) = dest
+        .attachments
+        .values()
+        .filter(|a| a.data == attachment.data)
+        .map(|a| a.id)
+        .min_by_key(|a| a.id())
+    {
+        return Some(existing);
+    }
+    let new_id = AttachmentId::next_free(dest);
+    dest.attachments.insert(
+        new_id,
+        Attachment {
+            id: new_id,
+            entries: HashSet::new(),
+            data: attachment.data.clone(),
+        },
+    );
+    Some(new_id)
 }
 
 /// Merge two histories together, returning the merged history.
@@ -2592,5 +2666,111 @@ mod merge_tests {
 
         let icon = destination_db.custom_icon(icon_id).unwrap();
         assert_eq!(icon.data, vec![5, 6, 7, 8]);
+    }
+
+    fn attachment_data(db: &Database, id: EntryId, name: &str) -> Option<Vec<u8>> {
+        db.entry(id)?
+            .attachment_by_name(name)
+            .map(|a| a.data.get().clone())
+    }
+
+    /// sseemayer/keepass-rs#336: a new entry from the source brings its
+    /// attachment along, even when the attachment IDs differ between both sides.
+    #[test]
+    fn test_new_entry_keeps_its_attachment() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+        destination_db.entry_mut(ENTRY1_ID).unwrap().edit(|e| {
+            e.add_attachment("dest.txt", crate::db::Value::unprotected(b"dest".to_vec()));
+        });
+        let new_id = source_db
+            .root_mut()
+            .add_entry()
+            .edit(|e| {
+                e.set_unprotected(fields::TITLE, "new in source");
+                e.add_attachment("source.txt", crate::db::Value::unprotected(b"source".to_vec()));
+            })
+            .id();
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(
+            attachment_data(&destination_db, new_id, "source.txt"),
+            Some(b"source".to_vec())
+        );
+        assert_eq!(
+            attachment_data(&destination_db, ENTRY1_ID, "dest.txt"),
+            Some(b"dest".to_vec())
+        );
+        assert_eq!(destination_db.num_attachments(), 2);
+    }
+
+    /// sseemayer/keepass-rs#336: when the source's version wins, its
+    /// attachments win too; the destination's go into the history with it.
+    #[test]
+    fn test_updated_entry_takes_attachments() {
+        let mut destination_db = create_test_database();
+        destination_db.entry_mut(ENTRY1_ID).unwrap().edit(|e| {
+            e.add_attachment("file.txt", crate::db::Value::unprotected(b"old".to_vec()));
+        });
+        let mut source_db = destination_db.clone();
+        sleep();
+        source_db.entry_mut(ENTRY1_ID).unwrap().edit_tracking(|e| {
+            e.add_attachment("file.txt", crate::db::Value::unprotected(b"new".to_vec()));
+        });
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(
+            attachment_data(&destination_db, ENTRY1_ID, "file.txt"),
+            Some(b"new".to_vec())
+        );
+        let entry = destination_db.entry(ENTRY1_ID).unwrap();
+        // the destination's version went into the history with its attachment
+        let count = entry.history.as_ref().unwrap().get_entries().len();
+        let kept_old = (0..count).any(|i| {
+            entry
+                .historical(i)
+                .unwrap()
+                .attachment_by_name("file.txt")
+                .map(|a| a.data.get().clone())
+                == Some(b"old".to_vec())
+        });
+        assert!(kept_old);
+    }
+
+    /// sseemayer/keepass-rs#336: history versions from the source keep their
+    /// own attachments.
+    #[test]
+    fn test_source_history_keeps_its_attachments() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+        destination_db.entry_mut(ENTRY1_ID).unwrap().edit(|e| {
+            e.add_attachment("dest.txt", crate::db::Value::unprotected(b"dest".to_vec()));
+        });
+        let new_id = source_db
+            .root_mut()
+            .add_entry()
+            .edit(|e| {
+                e.add_attachment("file.txt", crate::db::Value::unprotected(b"first".to_vec()));
+            })
+            .id();
+        sleep();
+        source_db.entry_mut(new_id).unwrap().edit_tracking(|e| {
+            e.set_unprotected(fields::TITLE, "renamed");
+        });
+
+        destination_db.merge(&source_db).unwrap();
+
+        let entry = destination_db.entry(new_id).unwrap();
+        assert_eq!(
+            attachment_data(&destination_db, new_id, "file.txt"),
+            Some(b"first".to_vec())
+        );
+        let old = entry.historical(0).unwrap();
+        assert_eq!(
+            old.attachment_by_name("file.txt").map(|a| a.data.get().clone()),
+            Some(b"first".to_vec())
+        );
     }
 }
