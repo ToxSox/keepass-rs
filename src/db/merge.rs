@@ -2773,4 +2773,43 @@ mod merge_tests {
             Some(b"first".to_vec())
         );
     }
+
+    /// #336 and #360 together: a history version from the source whose
+    /// attachment was replaced keeps its own data.
+    #[test]
+    fn test_source_history_keeps_replaced_attachment() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+        destination_db.entry_mut(ENTRY1_ID).unwrap().edit(|e| {
+            e.add_attachment("dest.txt", crate::db::Value::unprotected(b"dest".to_vec()));
+        });
+        let new_id = source_db
+            .root_mut()
+            .add_entry()
+            .edit(|e| {
+                e.add_attachment("file.txt", crate::db::Value::unprotected(b"first".to_vec()));
+            })
+            .id();
+        sleep();
+        source_db.entry_mut(new_id).unwrap().edit_tracking(|e| {
+            e.add_attachment("file.txt", crate::db::Value::unprotected(b"second".to_vec()));
+        });
+
+        destination_db.merge(&source_db).unwrap();
+
+        let entry = destination_db.entry(new_id).unwrap();
+        assert_eq!(
+            attachment_data(&destination_db, new_id, "file.txt"),
+            Some(b"second".to_vec())
+        );
+        let old = entry.historical(0).unwrap();
+        assert_eq!(
+            old.attachment_by_name("file.txt").map(|a| a.data.get().clone()),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            attachment_data(&destination_db, ENTRY1_ID, "dest.txt"),
+            Some(b"dest".to_vec())
+        );
+    }
 }
