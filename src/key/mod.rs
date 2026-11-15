@@ -6,6 +6,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::crypt::calculate_sha256;
+use hybrid_array::{typenum::U32, Array as GenericArray};
 
 pub type KeyElement = Vec<u8>;
 pub type KeyElements = Vec<KeyElement>;
@@ -133,6 +134,7 @@ fn parse_keyfile(buffer: &[u8]) -> Result<KeyElement, DatabaseKeyError> {
 pub struct DatabaseKey {
     password: Option<String>,
     keyfile: Option<Vec<u8>>,
+    composite_key: Option<CompositeKey>,
     #[cfg(feature = "challenge_response")]
     challenge_response_key: Option<ChallengeResponseKey>,
     #[cfg(feature = "challenge_response")]
@@ -201,7 +203,51 @@ impl DatabaseKey {
         Default::default()
     }
 
+    /// A key made from a [CompositeKey] obtained earlier with
+    /// [DatabaseKey::composite_key], instead of password and key file.
+    ///
+    /// Opens and saves KDBX 3 and KDBX 4 files with the same password and key
+    /// file. Not supported for KDB (KeePass 1) files.
+    pub fn from_composite_key(composite_key: CompositeKey) -> Self {
+        let mut key = DatabaseKey::default();
+        key.composite_key = Some(composite_key);
+        key
+    }
+
+    /// The composite key of a KDBX file: the SHA-256 hash of the hashed
+    /// password and the key file's key, before the key derivation (KDF).
+    ///
+    /// Apps can keep it in the platform's secure storage (Keychain with
+    /// biometrics, Windows Hello) to unlock the database without storing the
+    /// password. It does not change when the database is saved, and it opens
+    /// the database just like password and key file do: protect it as such.
+    ///
+    /// Not available for challenge-response keys, whose response depends on a
+    /// seed that changes with every save.
+    pub fn composite_key(&self) -> Result<CompositeKey, DatabaseKeyError> {
+        #[cfg(feature = "challenge_response")]
+        if self.challenge_response_key.is_some() {
+            return Err(DatabaseKeyError::CompositeKeyUnavailable);
+        }
+        let key = self.kdbx_composite_key()?;
+        Ok(CompositeKey(key.into()))
+    }
+
+    /// The composite key as used by KDBX 3 and KDBX 4.
+    pub(crate) fn kdbx_composite_key(&self) -> Result<GenericArray<u8, U32>, DatabaseKeyError> {
+        if let Some(composite_key) = &self.composite_key {
+            return Ok(GenericArray::from(composite_key.0));
+        }
+        let key_elements = self.get_key_elements()?;
+        let key_elements: Vec<&[u8]> = key_elements.iter().map(|v| &v[..]).collect();
+        Ok(calculate_sha256(&key_elements))
+    }
+
     pub(crate) fn get_key_elements(&self) -> Result<KeyElements, DatabaseKeyError> {
+        if self.composite_key.is_some() {
+            // only KDB (KeePass 1) asks for the elements themselves
+            return Err(DatabaseKeyError::CompositeKeyUnavailable);
+        }
         let mut out = Vec::new();
 
         if let Some(p) = &self.password {
@@ -230,7 +276,7 @@ impl DatabaseKey {
 
     /// Returns true if the database key is not associated with any key component.
     pub fn is_empty(&self) -> bool {
-        if self.password.is_some() || self.keyfile.is_some() {
+        if self.password.is_some() || self.keyfile.is_some() || self.composite_key.is_some() {
             return false;
         }
         #[cfg(feature = "challenge_response")]
@@ -238,6 +284,30 @@ impl DatabaseKey {
             return false;
         }
         true
+    }
+}
+
+/// The composite key of a KDBX database, see [DatabaseKey::composite_key].
+///
+/// Wiped from memory when dropped. Its bytes are as secret as the password.
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct CompositeKey([u8; 32]);
+
+impl CompositeKey {
+    /// Builds a composite key from bytes stored earlier with [CompositeKey::as_bytes].
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        CompositeKey(bytes)
+    }
+
+    /// The 32 bytes of the key, for storing it in secure storage.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for CompositeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CompositeKey([redacted])")
     }
 }
 
@@ -264,6 +334,12 @@ pub enum DatabaseKeyError {
     /// An error occurred while parsing the non-XML keyfile
     #[error("Invalid keyfile format")]
     InvalidKeyFile,
+
+    /// A composite key cannot be used here: KDB (KeePass 1) files need the
+    /// password and key file themselves, and challenge-response keys have no
+    /// fixed composite key.
+    #[error("A composite key is not available for this key or file format")]
+    CompositeKeyUnavailable,
 
     /// An error occurred during challenge-response authentication
     #[cfg(feature = "challenge_response")]
@@ -341,6 +417,7 @@ mod key_tests {
         assert!(DatabaseKey {
             password: None,
             keyfile: None,
+            composite_key: None,
             #[cfg(feature = "challenge_response")]
             challenge_response_key: None,
             #[cfg(feature = "challenge_response")]
@@ -350,5 +427,45 @@ mod key_tests {
         .is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn composite_key_matches_password_and_keyfile() -> Result<(), DatabaseKeyError> {
+        let key = DatabaseKey::new()
+            .with_password("asdf")
+            .with_keyfile(&mut "bare-key-file".as_bytes())?;
+        let composite = key.composite_key()?;
+        let from_composite = DatabaseKey::from_composite_key(composite.clone());
+        assert_eq!(from_composite.kdbx_composite_key()?, key.kdbx_composite_key()?);
+        assert!(!from_composite.is_empty());
+        assert_eq!(format!("{composite:?}"), "CompositeKey([redacted])");
+        Ok(())
+    }
+
+    #[cfg(feature = "save_kdbx4")]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn composite_key_opens_and_saves_database() {
+        use crate::Database;
+        let key = || DatabaseKey::new().with_password("asdf");
+        let mut db = Database::new();
+        db.meta.database_name = Some("composite".into());
+        let mut buffer = Vec::new();
+        db.save(&mut buffer, key()).unwrap();
+
+        // stored bytes, as an app would keep them in secure storage
+        let stored = *key().composite_key().unwrap().as_bytes();
+        let composite = || DatabaseKey::from_composite_key(super::CompositeKey::from_bytes(stored));
+
+        let opened = Database::open(&mut buffer.as_slice(), composite()).unwrap();
+        assert_eq!(opened.meta.database_name.as_deref(), Some("composite"));
+
+        // saving with the composite key keeps the password working
+        let mut resaved = Vec::new();
+        opened.save(&mut resaved, composite()).unwrap();
+        Database::open(&mut resaved.as_slice(), key()).unwrap();
+
+        let wrong = DatabaseKey::new().with_password("wrong").composite_key().unwrap();
+        assert!(Database::open(&mut buffer.as_slice(), DatabaseKey::from_composite_key(wrong)).is_err());
     }
 }
