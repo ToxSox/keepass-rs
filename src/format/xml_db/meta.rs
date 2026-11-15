@@ -377,13 +377,11 @@ impl<'de> Deserialize<'de> for CustomDataValue {
     where
         D: serde::Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-
-        // Try to decode as base64, if it fails, treat it as a regular string
-        match base64_engine::STANDARD.decode(&s) {
-            Ok(v) => Ok(CustomDataValue::Binary(v)),
-            Err(_) => Ok(CustomDataValue::String(s)),
-        }
+        // KDBX stores custom data values as text. Guessing "binary" for every
+        // value that happens to be valid base64 turned values like "true" or
+        // a base64-encoded key into bytes, so they no longer compared equal
+        // to what was stored (the file content itself stayed the same).
+        Ok(CustomDataValue::String(String::deserialize(deserializer)?))
     }
 }
 
@@ -535,6 +533,21 @@ mod tests {
     }
 
     #[test]
+    fn custom_data_text_that_looks_like_base64_stays_text() {
+        let xml = r#"<CustomData>
+            <Item><Key>flag</Key><Value>true</Value></Item>
+            <Item><Key>key</Key><Value>Y0n2KzG7IBJ3DqYcKl3jo3iahr2xU01di61nNUjZtS8=</Value></Item>
+        </CustomData>"#;
+        let cd: CustomData = quick_xml::de::from_str(xml).unwrap();
+        let text = |i: usize| match &cd.items[i].value {
+            CustomDataValue::String(s) => s.clone(),
+            _ => panic!("Expected string value"),
+        };
+        assert_eq!(text(0), "true");
+        assert_eq!(text(1), "Y0n2KzG7IBJ3DqYcKl3jo3iahr2xU01di61nNUjZtS8=");
+    }
+
+    #[test]
     fn test_deserialize_custom_data() {
         let xml = r#"<CustomData>
             <Item>
@@ -556,9 +569,10 @@ mod tests {
             _ => panic!("Expected string value"),
         }
         assert_eq!(cd.items[1].key, "binary_key");
+        // binary values are written as base64 and read back as that text
         match &cd.items[1].value {
-            CustomDataValue::Binary(b) => assert_eq!(b, &vec![1, 2, 3, 4, 5]),
-            _ => panic!("Expected binary value"),
+            CustomDataValue::String(s) => assert_eq!(s, "AQIDBAU="),
+            _ => panic!("Expected string value"),
         }
     }
 
@@ -905,9 +919,10 @@ mod tests {
             NaiveDateTime::from_str("2023-10-05T12:34:56").unwrap()
         );
         assert_eq!(cd.items[1].key, "binary_key");
+        // binary values are written as base64 and read back as that text
         match &cd.items[1].value {
-            CustomDataValue::Binary(b) => assert_eq!(b, &vec![1, 2, 3, 4, 5]),
-            _ => panic!("Expected binary value"),
+            CustomDataValue::String(s) => assert_eq!(s, "AQIDBAU="),
+            _ => panic!("Expected string value"),
         }
         assert_eq!(
             cd.items[1].last_modification_time.as_ref().unwrap().time,
