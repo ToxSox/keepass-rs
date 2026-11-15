@@ -213,6 +213,71 @@ impl Database {
         before - self.attachments.len()
     }
 
+    /// Drops the oldest history versions of an entry until the history fits
+    /// the database's limits (`HistoryMaxItems`, `HistoryMaxSize`), as KeePass
+    /// and KeePassXC do. A negative or missing limit means no limit. Returns
+    /// whether a version was dropped.
+    ///
+    /// Attachments that only the dropped versions used stay in the database;
+    /// call [Database::remove_unused_attachments] afterwards.
+    pub fn truncate_history(&mut self, id: EntryId) -> bool {
+        let max_items = self
+            .meta
+            .history_max_items
+            .filter(|m| *m >= 0)
+            .map(|m| m as usize);
+        let max_size = self.meta.history_max_size.filter(|m| *m >= 0).map(|m| m as usize);
+        if max_items.is_none() && max_size.is_none() {
+            return false;
+        }
+
+        let sizes: Vec<usize> = match self.entries.get(&id).and_then(|e| e.history.as_ref()) {
+            Some(history) => history
+                .entries
+                .iter()
+                .map(|v| self.entry_version_size(v))
+                .collect(),
+            None => return false,
+        };
+
+        let mut drop = 0;
+        let mut total: usize = sizes.iter().sum();
+        while drop < sizes.len() {
+            let count = sizes.len() - drop;
+            let too_many = max_items.is_some_and(|m| count > m);
+            let too_big = max_size.is_some_and(|m| total > m);
+            if !too_many && !too_big {
+                break;
+            }
+            #[allow(clippy::indexing_slicing)] // drop < sizes.len()
+            {
+                total -= sizes[drop];
+            }
+            drop += 1;
+        }
+        if drop == 0 {
+            return false;
+        }
+        if let Some(history) = self.entries.get_mut(&id).and_then(|e| e.history.as_mut()) {
+            history.entries.drain(..drop);
+        }
+        true
+    }
+
+    /// Approximate size of an entry version in bytes, like KeePassXC's
+    /// `Entry::size`: field names and values, tags and attachment data.
+    fn entry_version_size(&self, version: &Entry) -> usize {
+        let fields: usize = version.fields.iter().map(|(k, v)| k.len() + v.get().len()).sum();
+        let tags: usize = version.tags.iter().map(String::len).sum();
+        let attachments: usize = version
+            .attachments
+            .values()
+            .filter_map(|id| self.attachments.get(id))
+            .map(|a| a.data.get().len())
+            .sum();
+        fields + tags + attachments
+    }
+
     /// Get the number of attachments in the database
     pub fn num_attachments(&self) -> usize {
         self.attachments.len()

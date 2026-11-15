@@ -223,7 +223,9 @@ impl EntryRef<'_> {
             .and_then(|id| self.database().group(id))
     }
 
-    /// Gets an [EntryRef] to a historical version of the [Entry], if it exists
+    /// Gets an [EntryRef] to a historical version of the [Entry], if it exists.
+    ///
+    /// The history is ordered oldest first: index 0 is the oldest version.
     pub fn historical(&self, index: usize) -> Option<EntryRef<'_>> {
         if let Some(h) = &self.history {
             if index < h.entries.len() {
@@ -848,6 +850,12 @@ impl Drop for EntryTrack<'_> {
             let historical = std::mem::replace(&mut self.historical, Entry::new(parent_id));
 
             entry.history.get_or_insert_default().add_entry(historical);
+
+            if self.database.truncate_history(self.id) {
+                // versions dropped from the history may have been the last users
+                // of an attachment
+                self.database.remove_unused_attachments();
+            }
         }
     }
 }
@@ -941,5 +949,103 @@ mod tests {
 
         assert_eq!(db.num_entries(), 0);
         assert_eq!(db.num_attachments(), 0);
+    }
+
+    /// sseemayer/keepass-rs#389: the history is kept oldest first.
+    #[test]
+    fn tracked_edits_append_to_history() {
+        let mut db = Database::new();
+        let id = db
+            .root_mut()
+            .add_entry()
+            .edit(|e| e.set_unprotected(fields::TITLE, "v0"))
+            .id();
+        for title in ["v1", "v2", "v3"] {
+            db.entry_mut(id)
+                .unwrap()
+                .edit_tracking(|e| e.set_unprotected(fields::TITLE, title));
+        }
+        let entry = db.entry(id).unwrap();
+        let titles: Vec<_> = entry
+            .history
+            .as_ref()
+            .unwrap()
+            .get_entries()
+            .iter()
+            .map(|v| v.get_title())
+            .collect();
+        assert_eq!(titles, vec![Some("v0"), Some("v1"), Some("v2")]);
+        assert_eq!(entry.get_title(), Some("v3"));
+    }
+
+    /// sseemayer/keepass-rs#389: `HistoryMaxItems` drops the oldest versions.
+    #[test]
+    fn history_max_items_drops_oldest() {
+        let mut db = Database::new();
+        db.meta.history_max_items = Some(2);
+        let id = db
+            .root_mut()
+            .add_entry()
+            .edit(|e| e.set_unprotected(fields::TITLE, "v0"))
+            .id();
+        for title in ["v1", "v2", "v3", "v4"] {
+            db.entry_mut(id)
+                .unwrap()
+                .edit_tracking(|e| e.set_unprotected(fields::TITLE, title));
+        }
+        let entry = db.entry(id).unwrap();
+        let titles: Vec<_> = entry
+            .history
+            .as_ref()
+            .unwrap()
+            .get_entries()
+            .iter()
+            .map(|v| v.get_title())
+            .collect();
+        assert_eq!(titles, vec![Some("v2"), Some("v3")]);
+    }
+
+    /// sseemayer/keepass-rs#389: `HistoryMaxSize` drops the oldest versions.
+    #[test]
+    fn history_max_size_drops_oldest() {
+        let mut db = Database::new();
+        db.meta.history_max_items = Some(-1);
+        db.meta.history_max_size = Some(250);
+        let id = db.root_mut().add_entry().id();
+        for i in 0..5 {
+            // each version: "Notes" + 100 bytes
+            db.entry_mut(id)
+                .unwrap()
+                .edit_tracking(|e| e.set_unprotected(fields::NOTES, format!("{i}").repeat(100)));
+        }
+        let history = db.entry(id).unwrap().history.clone().unwrap();
+        assert_eq!(history.get_entries().len(), 2);
+        assert_eq!(
+            history.get_entries()[1].get(fields::NOTES),
+            Some("3".repeat(100).as_str())
+        );
+    }
+
+    #[test]
+    fn negative_history_limits_mean_unlimited() {
+        let mut db = Database::new();
+        db.meta.history_max_items = Some(-1);
+        db.meta.history_max_size = Some(-1);
+        let id = db.root_mut().add_entry().id();
+        for i in 0..20 {
+            db.entry_mut(id)
+                .unwrap()
+                .edit_tracking(|e| e.set_unprotected(fields::TITLE, format!("v{i}")));
+        }
+        assert_eq!(
+            db.entry(id)
+                .unwrap()
+                .history
+                .as_ref()
+                .unwrap()
+                .get_entries()
+                .len(),
+            20
+        );
     }
 }
