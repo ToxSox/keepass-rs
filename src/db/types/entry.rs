@@ -223,7 +223,9 @@ impl EntryRef<'_> {
             .and_then(|id| self.database().group(id))
     }
 
-    /// Gets an [EntryRef] to a historical version of the [Entry], if it exists
+    /// Gets an [EntryRef] to a historical version of the [Entry], if it exists.
+    ///
+    /// The history is ordered oldest first: index 0 is the oldest version.
     pub fn historical(&self, index: usize) -> Option<EntryRef<'_>> {
         if let Some(h) = &self.history {
             if index < h.entries.len() {
@@ -856,10 +858,15 @@ impl Drop for EntryTrack<'_> {
 
             entry.history.get_or_insert_default().add_entry(historical);
 
-            // history positions changed, and attachments replaced while
-            // tracking may only be used by the version that just went into
-            // the history: bring the references up to date
-            self.database.rebuild_attachment_references();
+            // history positions changed, attachments replaced while tracking
+            // may only be used by the version that just went into the history,
+            // and versions dropped by the limits may have been the last users
+            // of an attachment
+            if self.database.truncate_history(self.id) {
+                self.database.remove_unused_attachments();
+            } else {
+                self.database.rebuild_attachment_references();
+            }
         }
     }
 }
@@ -1025,5 +1032,141 @@ mod tests {
         let (mut db, id) = reopened_with_attachment();
         db.entry_mut(id).unwrap().remove_attachment_by_name("file.txt");
         assert_eq!(db.num_attachments(), 0);
+    }
+
+    /// sseemayer/keepass-rs#389: the history is kept oldest first.
+    #[test]
+    fn tracked_edits_append_to_history() {
+        let mut db = Database::new();
+        let id = db
+            .root_mut()
+            .add_entry()
+            .edit(|e| e.set_unprotected(fields::TITLE, "v0"))
+            .id();
+        for title in ["v1", "v2", "v3"] {
+            db.entry_mut(id)
+                .unwrap()
+                .edit_tracking(|e| e.set_unprotected(fields::TITLE, title));
+        }
+        let entry = db.entry(id).unwrap();
+        let titles: Vec<_> = entry
+            .history
+            .as_ref()
+            .unwrap()
+            .get_entries()
+            .iter()
+            .map(|v| v.get_title())
+            .collect();
+        assert_eq!(titles, vec![Some("v0"), Some("v1"), Some("v2")]);
+        assert_eq!(entry.get_title(), Some("v3"));
+    }
+
+    /// sseemayer/keepass-rs#389: `HistoryMaxItems` drops the oldest versions.
+    #[test]
+    fn history_max_items_drops_oldest() {
+        let mut db = Database::new();
+        db.meta.history_max_items = Some(2);
+        let id = db
+            .root_mut()
+            .add_entry()
+            .edit(|e| e.set_unprotected(fields::TITLE, "v0"))
+            .id();
+        for title in ["v1", "v2", "v3", "v4"] {
+            db.entry_mut(id)
+                .unwrap()
+                .edit_tracking(|e| e.set_unprotected(fields::TITLE, title));
+        }
+        let entry = db.entry(id).unwrap();
+        let titles: Vec<_> = entry
+            .history
+            .as_ref()
+            .unwrap()
+            .get_entries()
+            .iter()
+            .map(|v| v.get_title())
+            .collect();
+        assert_eq!(titles, vec![Some("v2"), Some("v3")]);
+    }
+
+    /// sseemayer/keepass-rs#389: `HistoryMaxSize` drops the oldest versions.
+    #[test]
+    fn history_max_size_drops_oldest() {
+        let mut db = Database::new();
+        db.meta.history_max_items = Some(-1);
+        db.meta.history_max_size = Some(250);
+        let id = db.root_mut().add_entry().id();
+        for i in 0..5 {
+            // each version: "Notes" + 100 bytes
+            db.entry_mut(id)
+                .unwrap()
+                .edit_tracking(|e| e.set_unprotected(fields::NOTES, format!("{i}").repeat(100)));
+        }
+        let history = db.entry(id).unwrap().history.clone().unwrap();
+        assert_eq!(history.get_entries().len(), 2);
+        assert_eq!(
+            history.get_entries()[1].get(fields::NOTES),
+            Some("3".repeat(100).as_str())
+        );
+    }
+
+    #[test]
+    fn negative_history_limits_mean_unlimited() {
+        let mut db = Database::new();
+        db.meta.history_max_items = Some(-1);
+        db.meta.history_max_size = Some(-1);
+        let id = db.root_mut().add_entry().id();
+        for i in 0..20 {
+            db.entry_mut(id)
+                .unwrap()
+                .edit_tracking(|e| e.set_unprotected(fields::TITLE, format!("v{i}")));
+        }
+        assert_eq!(
+            db.entry(id)
+                .unwrap()
+                .history
+                .as_ref()
+                .unwrap()
+                .get_entries()
+                .len(),
+            20
+        );
+    }
+
+    /// #360 and #389 together: the size limit counts attachments, attachments
+    /// stay while a history version uses them and leave with the last one.
+    #[test]
+    fn history_limits_and_attachments() {
+        let mut db = Database::new();
+        db.meta.history_max_items = Some(-1);
+        db.meta.history_max_size = Some(150);
+        let id = db
+            .root_mut()
+            .add_entry()
+            .edit(|e| {
+                e.add_attachment("big.bin", Value::unprotected(vec![0u8; 100]));
+            })
+            .id();
+        db.entry_mut(id).unwrap().edit_tracking(|e| {
+            e.as_mut().remove_attachment_by_name("big.bin");
+        });
+        assert_eq!(db.num_attachments(), 1, "history still uses big.bin");
+
+        db.entry_mut(id).unwrap().edit_tracking(|e| {
+            e.add_attachment("other.bin", Value::unprotected(vec![1u8; 100]));
+        });
+        db.entry_mut(id).unwrap().edit_tracking(|e| {
+            e.as_mut().remove_attachment_by_name("other.bin");
+        });
+
+        // versions: [big.bin (100), none (0), other.bin (100)]; dropping the
+        // oldest brings the history to 100 bytes, within the limit
+        let entry = db.entry(id).unwrap();
+        assert_eq!(entry.history.as_ref().unwrap().get_entries().len(), 2);
+        let newest = entry.historical(1).unwrap();
+        assert_eq!(
+            newest.attachment_by_name("other.bin").unwrap().data.get(),
+            &vec![1u8; 100]
+        );
+        assert_eq!(db.num_attachments(), 1, "big.bin is no longer used");
     }
 }

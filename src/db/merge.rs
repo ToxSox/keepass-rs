@@ -556,7 +556,7 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
 
         if source_last_modification > dest_last_modification {
             // add the previous dest entry to history if it has diverged
-            if let Some(last_history_entry) = merged_history.entries.first() {
+            if let Some(last_history_entry) = merged_history.entries.last() {
                 if have_entries_diverged(&dest_entry, last_history_entry) {
                     let mut dest_entry_for_history = dest_entry.deref().clone();
                     dest_entry_for_history.history = None;
@@ -698,6 +698,9 @@ fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result
             (true, true) => break,
         }
     }
+
+    // collected newest first; KeePass keeps the history oldest first
+    entries.reverse();
 
     Ok(History { entries })
 }
@@ -933,9 +936,10 @@ mod merge_tests {
             }
 
             if let Some(entry_modification_time) = entry.times.last_modification.as_ref() {
-                if last_modification_time.unwrap() < entry_modification_time {
+                // KeePass keeps the history oldest first
+                if last_modification_time.unwrap() > entry_modification_time {
                     panic!(
-                        "History entries are not ordered by last modification time: {:?} came after {:?}",
+                        "History entries are not ordered oldest first: {:?} came before {:?}",
                         last_modification_time, entry_modification_time
                     );
                 }
@@ -1764,7 +1768,7 @@ mod merge_tests {
         let history = entry.history.clone().unwrap();
         assert_history_ordered(&history);
         assert_eq!(
-            history.entries[0].get(fields::TITLE),
+            history.entries.last().unwrap().get(fields::TITLE),
             Some("entry2_modified_in_source")
         );
     }
@@ -2071,11 +2075,11 @@ mod merge_tests {
         let merged_history = entry.history.clone().unwrap();
         assert_history_ordered(&merged_history);
         assert_eq!(merged_history.entries.len(), 2);
+        assert_eq!(merged_history.entries[0].get(fields::TITLE), Some("entry1"));
         assert_eq!(
-            merged_history.entries[0].get(fields::TITLE),
+            merged_history.entries[1].get(fields::TITLE),
             Some("entry1_updated_from_destination")
         );
-        assert_eq!(merged_history.entries[1].get(fields::TITLE), Some("entry1"));
 
         // Merging again should not result in any additional change.
         let merge_result = destination_db.merge(&destination_db.clone()).unwrap();
@@ -2116,11 +2120,11 @@ mod merge_tests {
         let merged_history = entry.history.clone().unwrap();
         assert_history_ordered(&merged_history);
         assert_eq!(merged_history.entries.len(), 2);
+        assert_eq!(merged_history.entries[0].get(fields::TITLE), Some("entry1"));
         assert_eq!(
-            merged_history.entries[0].get(fields::TITLE),
+            merged_history.entries[1].get(fields::TITLE),
             Some("entry1_updated_from_source")
         );
-        assert_eq!(merged_history.entries[1].get(fields::TITLE), Some("entry1"));
 
         // Merging the same source again should not result in any additional change.
         let merge_result = destination_db.merge(&source_db).unwrap();

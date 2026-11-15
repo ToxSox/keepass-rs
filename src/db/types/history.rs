@@ -8,19 +8,19 @@ pub struct History {
 }
 
 impl History {
-    /// Add a new entry to the history
+    /// Add a new entry to the end of the history.
+    ///
+    /// KeePass keeps the history oldest first, so the newest version is the
+    /// last one; this is also the order in the file.
     pub fn add_entry(&mut self, mut entry: Entry) {
-        // DISCUSS: should we make sure that the last modification time is not the same
-        // or older than the entry at the top of the history?
-
         // Remove the history from the new history entry to avoid having
         // an exponential number of history entries.
         entry.history.take();
 
-        self.entries.insert(0, entry);
+        self.entries.push(entry);
     }
 
-    /// Get the history entries
+    /// Get the history entries, oldest first.
     pub fn get_entries(&self) -> &Vec<Entry> {
         &self.entries
     }
