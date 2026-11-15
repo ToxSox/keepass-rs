@@ -184,15 +184,12 @@ impl Database {
         db
     }
 
-    /// Rebuilds each attachment's references from the entries and their
-    /// history as they are now, and removes the attachments that nothing
-    /// refers to any more. Returns how many were removed.
+    /// Rebuilds each attachment's references (which entry, which history
+    /// version) from the entries as they are now.
     ///
-    /// Replacing an entry's history directly (to trim it, say) leaves the
-    /// attachments only the dropped versions used in the database, where
-    /// saving would still write them, and leaves references to history
-    /// positions that no longer hold the same version. This puts both right.
-    pub fn remove_unused_attachments(&mut self) -> usize {
+    /// The file format only stores references from entries to attachments, so
+    /// this runs after loading; it also runs whenever history positions shift.
+    pub(crate) fn rebuild_attachment_references(&mut self) {
         for attachment in self.attachments.values_mut() {
             attachment.entries.clear();
         }
@@ -207,6 +204,33 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// Whether any entry or any version in an entry's history refers to the attachment.
+    ///
+    /// Scans the entries instead of trusting the attachment's references, so it
+    /// is right even while those are being updated.
+    pub(crate) fn attachment_in_use(&self, id: AttachmentId) -> bool {
+        self.entries.values().any(|entry| {
+            entry.attachments.values().any(|a| *a == id)
+                || entry
+                    .history
+                    .iter()
+                    .flat_map(|h| h.entries.iter())
+                    .any(|version| version.attachments.values().any(|a| *a == id))
+        })
+    }
+
+    /// Rebuilds each attachment's references from the entries and their
+    /// history as they are now, and removes the attachments that nothing
+    /// refers to any more. Returns how many were removed.
+    ///
+    /// Replacing an entry's history directly (to trim it, say) leaves the
+    /// attachments only the dropped versions used in the database, where
+    /// saving would still write them, and leaves references to history
+    /// positions that no longer hold the same version. This puts both right.
+    pub fn remove_unused_attachments(&mut self) -> usize {
+        self.rebuild_attachment_references();
         let before = self.attachments.len();
         self.attachments
             .retain(|_, attachment| !attachment.entries.is_empty());

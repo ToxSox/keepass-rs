@@ -169,6 +169,11 @@ impl KeePassFile {
         db.attachments = attachments;
         db.custom_icons = custom_icons;
 
+        // The file only stores which attachments an entry uses; build the
+        // reverse references, so removing an attachment from one version does
+        // not drop data that another version (its history) still needs.
+        db.rebuild_attachment_references();
+
         // Re-populate CustomIcon back-reference sets.
         //
         // The XML parser creates CustomIcon values with empty `entries` and `groups` sets

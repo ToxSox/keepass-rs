@@ -314,6 +314,10 @@ pub struct EntryMut<'a> {
     database: &'a mut Database,
     id: EntryId,
     history_index: Option<usize>,
+    /// Set while an [EntryTrack] is open: the version that goes into the
+    /// history on drop is not in the database yet, so attachments it uses
+    /// must not be dropped from the database before then.
+    defer_attachment_cleanup: bool,
 }
 
 impl EntryMut<'_> {
@@ -322,6 +326,7 @@ impl EntryMut<'_> {
             database,
             id,
             history_index: None,
+            defer_attachment_cleanup: false,
         }
     }
 
@@ -334,6 +339,7 @@ impl EntryMut<'_> {
             database,
             id,
             history_index,
+            defer_attachment_cleanup: false,
         }
     }
 
@@ -344,6 +350,7 @@ impl EntryMut<'_> {
                 database: self.database,
                 id: self.id,
                 history_index: Some(index),
+                defer_attachment_cleanup: self.defer_attachment_cleanup,
             })
         } else {
             None
@@ -435,7 +442,8 @@ impl EntryMut<'_> {
     pub fn add_attachment(&mut self, name: impl Into<String>, data: Value<Vec<u8>>) -> AttachmentMut<'_> {
         let id = AttachmentId::next_free(self.database);
 
-        let entries: HashSet<(EntryId, Option<usize>)> = vec![(self.id, None)].into_iter().collect();
+        let entries: HashSet<(EntryId, Option<usize>)> =
+            vec![(self.id, self.history_index)].into_iter().collect();
 
         self.database
             .attachments
@@ -451,29 +459,34 @@ impl EntryMut<'_> {
 
     /// Remove an attachment by name from this entry.
     ///
-    /// If it was the last reference to the attachment, remove it from the database.
+    /// The attachment itself is removed from the database once no version of any entry uses it.
     pub fn remove_attachment_by_name(&mut self, name: &str) {
-        let id = self.id;
-
         // remove the attachment reference from this entry
         if let Some(attachment_id) = self.attachments.remove(name) {
-            if let Some(mut attachment) = self.database.attachment_mut(attachment_id) {
-                attachment.entries.retain(|&(entry_id, _)| entry_id != id);
+            self.release_attachment(attachment_id);
+        }
+    }
 
-                // if this was the last entry referencing the attachment, remove it from the database
-                if attachment.entries.is_empty() {
-                    attachment.remove();
-                }
+    /// Drops this version's reference to an attachment, and the attachment
+    /// itself once no version of any entry uses it.
+    fn release_attachment(&mut self, attachment_id: AttachmentId) {
+        let id = self.id;
+        let history_index = self.history_index;
+        let still_used_here = self.attachments.values().any(|a| *a == attachment_id);
+        if let Some(attachment) = self.database.attachments.get_mut(&attachment_id) {
+            if !still_used_here {
+                attachment.entries.remove(&(id, history_index));
             }
+        }
+        if !self.defer_attachment_cleanup && !self.database.attachment_in_use(attachment_id) {
+            self.database.attachments.remove(&attachment_id);
         }
     }
 
     /// Remove an attachment by id from this entry.
     ///
-    /// If it was the last reference to the attachment, remove it from the database.
+    /// The attachment itself is removed from the database once no version of any entry uses it.
     pub fn remove_attachment_by_id(&mut self, attachment_id: AttachmentId) {
-        let id = self.id;
-
         // remove the attachment reference from this entry
         let mut names_to_remove = Vec::new();
         for (name, &att_id) in &self.attachments {
@@ -486,14 +499,7 @@ impl EntryMut<'_> {
             self.attachments.remove(&name);
         }
 
-        if let Some(mut attachment) = self.database.attachment_mut(attachment_id) {
-            attachment.entries.retain(|&(entry_id, _)| entry_id != id);
-
-            // if this was the last entry referencing the attachment, remove it from the database
-            if attachment.entries.is_empty() {
-                attachment.remove();
-            }
-        }
+        self.release_attachment(attachment_id);
     }
 
     /// Remove the icon from this entry, if it exists.
@@ -629,18 +635,18 @@ impl EntryMut<'_> {
         }
         attachment_ids.sort_by_key(|attachment_id| attachment_id.id());
         attachment_ids.dedup();
-        for attachment_id in attachment_ids {
-            if let Some(mut attachment) = self.database.attachment_mut(attachment_id) {
-                attachment.entries.retain(|&(entry_id, _)| entry_id != id);
-
-                // if this was the last entry referencing the attachment, remove it from the database
-                if attachment.entries.is_empty() {
-                    attachment.remove();
-                }
-            }
-        }
 
         let entry = self.database.entries.remove(&self.id).expect("Entry not found");
+
+        // drop the attachments no other entry uses
+        for attachment_id in attachment_ids {
+            if let Some(attachment) = self.database.attachments.get_mut(&attachment_id) {
+                attachment.entries.retain(|&(entry_id, _)| entry_id != id);
+            }
+            if !self.database.attachment_in_use(attachment_id) {
+                self.database.attachments.remove(&attachment_id);
+            }
+        }
 
         // Remove from parent group
         let mut parent = self
@@ -717,6 +723,7 @@ impl EntryTrack<'_> {
             database: self.database,
             id: self.id,
             history_index: None,
+            defer_attachment_cleanup: true,
         }
     }
 
@@ -848,6 +855,11 @@ impl Drop for EntryTrack<'_> {
             let historical = std::mem::replace(&mut self.historical, Entry::new(parent_id));
 
             entry.history.get_or_insert_default().add_entry(historical);
+
+            // history positions changed, and attachments replaced while
+            // tracking may only be used by the version that just went into
+            // the history: bring the references up to date
+            self.database.rebuild_attachment_references();
         }
     }
 }
@@ -940,6 +952,78 @@ mod tests {
         db.entry_mut(entry_id).unwrap().remove();
 
         assert_eq!(db.num_entries(), 0);
+        assert_eq!(db.num_attachments(), 0);
+    }
+
+    /// A database with one entry holding one attachment, saved and opened
+    /// again, so it is in the state right after loading a file.
+    #[cfg(feature = "save_kdbx4")]
+    fn reopened_with_attachment() -> (Database, super::EntryId) {
+        use crate::DatabaseKey;
+        let mut db = Database::new();
+        let id = db
+            .root_mut()
+            .add_entry()
+            .edit(|e| {
+                e.set_unprotected(fields::TITLE, "with attachment");
+                e.add_attachment("file.txt", Value::unprotected(b"old".to_vec()));
+            })
+            .id();
+        let mut buffer = Vec::new();
+        db.save(&mut buffer, DatabaseKey::new().with_password("test"))
+            .unwrap();
+        let db = Database::open(&mut buffer.as_slice(), DatabaseKey::new().with_password("test")).unwrap();
+        (db, id)
+    }
+
+    #[cfg(feature = "save_kdbx4")]
+    #[test]
+    fn loaded_attachments_know_their_entries() {
+        let (db, id) = reopened_with_attachment();
+        let entry = db.entry(id).unwrap();
+        let attachment = entry.attachment_by_name("file.txt").unwrap();
+        let users: Vec<_> = attachment.entries(false).map(|e| e.id()).collect();
+        assert_eq!(users, vec![id]);
+    }
+
+    /// sseemayer/keepass-rs#360
+    #[cfg(feature = "save_kdbx4")]
+    #[test]
+    fn tracked_replace_keeps_old_attachment_in_history() {
+        let (mut db, id) = reopened_with_attachment();
+        db.entry_mut(id).unwrap().edit_tracking(|e| {
+            e.add_attachment("file.txt", Value::unprotected(b"new".to_vec()));
+        });
+
+        let entry = db.entry(id).unwrap();
+        assert_eq!(entry.attachment_by_name("file.txt").unwrap().data.get(), b"new");
+        let old = entry.historical(0).unwrap();
+        assert_eq!(old.attachment_by_name("file.txt").unwrap().data.get(), b"old");
+        assert_eq!(db.num_attachments(), 2);
+    }
+
+    /// sseemayer/keepass-rs#360
+    #[cfg(feature = "save_kdbx4")]
+    #[test]
+    fn removing_from_current_version_keeps_history_attachment() {
+        let (mut db, id) = reopened_with_attachment();
+        db.entry_mut(id).unwrap().edit_tracking(|e| {
+            e.set_unprotected(fields::NOTES, "history now holds the attachment too");
+        });
+        db.entry_mut(id).unwrap().remove_attachment_by_name("file.txt");
+
+        let entry = db.entry(id).unwrap();
+        assert!(entry.attachment_by_name("file.txt").is_none());
+        let old = entry.historical(0).unwrap();
+        assert_eq!(old.attachment_by_name("file.txt").unwrap().data.get(), b"old");
+        assert_eq!(db.num_attachments(), 1);
+    }
+
+    #[cfg(feature = "save_kdbx4")]
+    #[test]
+    fn removing_last_use_drops_attachment() {
+        let (mut db, id) = reopened_with_attachment();
+        db.entry_mut(id).unwrap().remove_attachment_by_name("file.txt");
         assert_eq!(db.num_attachments(), 0);
     }
 }
